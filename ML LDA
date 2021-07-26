@@ -1,0 +1,277 @@
+# 导入函数库
+from jqdata import *
+import numpy as np
+import pandas as pd
+from sklearn.discriminant_analysis import LinearDiscriminantAnalysis #LDA
+
+## 初始化函数，设定要操作的股票、基准等等
+def initialize(context):
+    # 设定指数
+    g.stockindex = '000300.XSHG' 
+    # 设定沪深300作为基准
+    set_benchmark('000300.XSHG')
+    # True为开启动态复权模式，使用真实价格交易
+    set_option('use_real_price', True) 
+    # 设定成交量比例
+    set_option('order_volume_ratio', 1)
+    # 股票类交易手续费是：买入时佣金万分之三，卖出时佣金万分之三加千分之一印花税, 每笔交易佣金最低扣5块钱
+    set_order_cost(OrderCost(open_tax=0, close_tax=0.001, \
+                             open_commission=0.0003, close_commission=0.0003,\
+                             close_today_commission=0, min_commission=5), type='stock')
+    # 最大持仓数量
+    g.stocknum = 10
+
+    ## 自动设定调仓月份（如需使用自动，注销下段）
+    f = 12  # 调仓频率
+    log.info(list(range(1,13,12//f)))
+    g.Transfer_date = list(range(1,13,12//f))
+    
+    ## 手动设定调仓月份（如需使用手动，注释掉上段）
+    # g.Transfer_date = (3,9)
+    
+    #根据大盘止损，如不想加入大盘止损，注释下句即可
+    # run_daily(dapan_stoploss, time='open') 
+    
+    ## 按月调用程序
+    run_monthly(trade, monthday=1, time='open')
+
+## 交易函数
+def trade(context):
+    # 获取当前月份
+    months = context.current_dt.month
+    # 如果当前月为交易月
+    if months in g.Transfer_date:
+        ## 获得Buylist
+        Buylist = check_stocks(context)
+        
+        ## 卖出
+        if len(context.portfolio.positions) > 0:
+            for stock in context.portfolio.positions.keys():
+                if stock not in Buylist:
+                    order_target(stock, 0)
+
+        ## 分配资金
+        if len(context.portfolio.positions) < g.stocknum :
+            Num = g.stocknum  - len(context.portfolio.positions)
+            Cash = context.portfolio.cash/Num
+        else: 
+            Cash = 0
+
+        ## 买入
+        if len(Buylist) > 0:
+            for stock in Buylist:
+               if stock not in context.portfolio.positions.keys():
+                   order_value(stock,Cash)
+    else:
+        return
+    
+## 选股函数
+def check_stocks(context):
+    # 获取所有沪深300的股票
+    hs300_code = get_index_stocks('000300.XSHG')
+    
+    #读取24个月数据
+    n_date_count = 24
+    
+    #获取日期数据
+    mt_index = get_bars('600519.XSHG', n_date_count, unit='1M',
+    fields=['date','close'],
+    include_now=False,end_dt = context.current_dt)
+
+    date_count = mt_index['date']    
+    
+    #沪深300指数成分股
+    hs300_code_all = []
+
+    #沪深300指数收盘价
+    hs300_stocks_close = []
+    hs300_stocks_close = pd.DataFrame({'date':date_count})    
+    
+    for code in hs300_code:
+        stock_index = get_bars(code, n_date_count, unit='1M',
+                  fields=['date','close'],
+                  include_now=False,end_dt = context.current_dt)
+        #计算收盘价
+        stock_close = [float(close) for close in stock_index['close']]
+        if(len(stock_close)==n_date_count):
+            hs300_code_all.append(code)
+            hs300_stocks_close[code] = stock_close
+    
+    #数据集_月度对数收益
+    hs300_stocks_close_value = hs300_stocks_close[hs300_code_all]
+    R_hs300 = np.log(hs300_stocks_close_value.shift(-1)/hs300_stocks_close_value)
+    n_R_hs300 = len(R_hs300)     
+    R_hs300 = R_hs300.drop(index = n_R_hs300-1)
+    
+    #构造数据集
+    #
+    #
+    #T：第T期
+    #EP：净利润/总市值
+    #SP：营业收入/总市值
+    #Sales_G_P：营业收入同比增长率
+    #Profit_G_P：净利润同比增长率
+    #ln_capital：总市值取对数
+    #ln_price：股价取对数
+    #ROE
+    #ROA
+    #分类标签：下个月收益前30%股票标注为 +1；后30%股票标注为 -1.
+    data_svm = pd.DataFrame({'T':[],
+                             'EP':[],
+                             'SP':[],
+                             'Sales_G_P':[],
+                             'Profit_G_P':[],
+                             'ln_capital':[],
+                             'ln_price':[],
+                             'ROE':[],
+                             'ROA':[],
+                             'LABEL':[]})
+    
+    #获取数据集
+    #
+    #
+    
+    for i in range(0,n_R_hs300-1):
+        
+        #日期数据（第i月）
+        date_i = date_count[i]
+                
+        #第T期
+        T = (i+1)*np.ones(150)
+        
+        #正数倒数各取75只
+        R_month = R_hs300.iloc[i]
+        R_month_sort = R_month.sort_values(ascending = False)
+        n_R = len(R_month)
+        code_150 = []
+        code_1 = R_month_sort.index[range(0,75)] #收益前30%的股票
+        code_2 = R_month_sort.index[range(n_R-75,n_R)] #收益后30%的股票
+        
+        for code_j in code_1:
+            code_150.append(code_j)
+        
+        for code_j in code_2:
+            code_150.append(code_j)
+        
+        label_stocks = np.append(np.ones(75),-np.ones(75))
+        label_mat = pd.DataFrame({'code':code_150,'label':label_stocks})
+        
+        # 这里不能使用 in 操作, 要使用in_()函数
+        df = get_fundamentals(query(valuation.code,
+                                    valuation.market_cap,
+                                    income.net_profit,
+                                    income.operating_revenue,
+                                    indicator.inc_revenue_year_on_year,
+                                    indicator.inc_net_profit_year_on_year,
+                                    indicator.roa,
+                                    indicator.roe).filter(
+                valuation.code.in_(code_150)), 
+                date=date_i)
+                
+        n_true_len = len(df['code'])
+        
+        #第T期
+        T = (i+1)*np.ones(n_true_len) 
+        
+        #除去缺失值后的股票代码
+        code_true = list(df['code'])
+        
+        market_cap = df['market_cap'] #总市值
+        net_profit = df['net_profit'] #净利润
+        operating_revenue = df['operating_revenue'] #营业收入
+        Sales_G_P = df['inc_revenue_year_on_year'] #营业收入同比增长率
+        Profit_G_P = df['inc_net_profit_year_on_year'] #净利润同比增长率
+        ROA = df['roa'] #ROA
+        ROE = df['roe'] #ROE
+        EP = net_profit/market_cap #EP
+        SP = operating_revenue/market_cap #SP
+        ln_capital = np.log(market_cap) #市值对数
+        price = hs300_stocks_close.loc[i,code_true] #股价数据
+        ln_price = [np.log(p) for p in price] #股价对数
+        label_true = list(label_mat[label_mat['code'].isin(code_true)]['label'])
+        
+        data_loop = pd.DataFrame({'T':T,
+                                  'EP':EP,
+                                  'SP':SP,
+                                  'Sales_G_P':Sales_G_P,
+                                  'Profit_G_P':Profit_G_P,
+                                  'ln_capital':ln_capital,
+                                  'ln_price':ln_price,
+                                  'ROE':ROE,
+                                  'ROA':ROA,
+                                  'LABEL':label_true})
+        
+        data_svm=pd.concat([data_svm,data_loop])
+    
+    #删除缺失值&修改索引
+    data_svm = data_svm.dropna()
+    index_1 = range(0,len(data_svm))
+    data_svm.index = index_1 #重置索引
+    
+    #提取数据特征与标签
+    datas_all = data_svm.iloc[:,range(1,9)]
+    features_all = data_svm['LABEL']
+    
+    #训练LDA模型
+    clf1 = LinearDiscriminantAnalysis(solver='lsqr', shrinkage='auto').fit(datas_all, features_all)
+    
+    #读取当月数据
+    date_current = date_count[n_R_hs300-1]
+    
+    # 这里不能使用 in 操作, 要使用in_()函数
+    df_1 = get_fundamentals(query(valuation.code,
+                                valuation.market_cap,
+                                income.net_profit,
+                                income.operating_revenue,
+                                indicator.inc_revenue_year_on_year,
+                                indicator.inc_net_profit_year_on_year,
+                                indicator.roa,
+                                indicator.roe).filter(
+                                        valuation.code.in_(hs300_code_all)),
+        date=date_current)
+    
+    #除去缺失值后的股票代码
+    hs300_code_true = list(df_1['code'])
+    
+    market_cap = df_1['market_cap'] #总市值
+    net_profit = df_1['net_profit'] #净利润
+    operating_revenue = df_1['operating_revenue'] #营业收入
+    Sales_G_P = df_1['inc_revenue_year_on_year'] #营业收入同比增长率
+    Profit_G_P = df_1['inc_net_profit_year_on_year'] #净利润同比增长率
+    ROA = df_1['roa'] #ROA
+    ROE = df_1['roe'] #ROE
+    EP = net_profit/market_cap #EP
+    SP = operating_revenue/market_cap #SP
+    ln_capital = np.log(market_cap) #市值对数
+    price = hs300_stocks_close.loc[n_R_hs300-1,hs300_code_true] #股价数据
+    ln_price = [np.log(p) for p in price] #股价对数
+    data_current = pd.DataFrame({'code':hs300_code_true,
+                              'EP':EP,
+                              'SP':SP,
+                              'Sales_G_P':Sales_G_P,
+                              'Profit_G_P':Profit_G_P,
+                              'ln_capital':ln_capital,
+                              'ln_price':ln_price,
+                              'ROE':ROE,
+                              'ROA':ROA})
+                              
+    data_current = data_current.dropna()
+    
+    #预测数据
+    datas_test = data_current.iloc[:,range(1,9)]
+    y_pred = clf1.predict_proba(datas_test)  # 使用模型预测值
+    pred_proba = y_pred[:,1]
+    
+    #排序
+    pred_mat = pd.DataFrame({'code':data_current['code'],
+                             'pred':pred_proba})
+                            
+    pred_mat_sort = pred_mat.sort_values('pred',ascending = False)
+    
+    #买入股票
+    Codes = pred_mat_sort.iloc[0:10,0]
+    
+    #在日志中输出股票代码
+    log.info(str(Codes))
+    
+    return list(Codes)
